@@ -56,26 +56,69 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── read requirements ─────────────────────────────────────────────────────────
-requirements=()
+# Supports nested format where parent lines provide context for child lines:
+#
+#   The alb-openresty build
+#   - are running on ARM?
+#   - are using centralized cache?
+#
+# Produces:
+#   "The alb-openresty build are running on ARM?"
+#   "The alb-openresty build are using centralized cache?"
+#
+# Flat lines (no parent) are treated as standalone requirements.
+
+raw_lines=()
 if [[ "$INPUT_FILE" == "-" ]]; then
   while IFS= read -r line; do
-    requirements+=("$line")
+    raw_lines+=("$line")
   done
 else
   [[ ! -f "$INPUT_FILE" ]] && { echo "Error: file not found: $INPUT_FILE"; exit 2; }
   while IFS= read -r line; do
-    requirements+=("$line")
+    raw_lines+=("$line")
   done < "$INPUT_FILE"
 fi
 
-# filter blanks and comments
-filtered=()
-for req in "${requirements[@]}"; do
-  trimmed="${req#"${req%%[![:space:]]*}"}"
+# Pass 1: classify lines into (parent, child[]) groups
+# - Lines starting with "- " are children of the preceding non-child line
+# - Non-child, non-blank, non-comment lines are parents (context providers)
+# - A parent with no children becomes a standalone requirement
+
+requirements=()
+parent=""
+parent_used=false
+
+flush_parent() {
+  if [[ -n "$parent" && "$parent_used" == false ]]; then
+    requirements+=("$parent")
+  fi
+}
+
+for line in "${raw_lines[@]}"; do
+  trimmed="${line#"${line%%[![:space:]]*}"}"
+  trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+
   [[ -z "$trimmed" || "$trimmed" == \#* ]] && continue
-  filtered+=("$req")
+
+  if [[ "$trimmed" == -* ]]; then
+    # child: strip "- " prefix, prepend parent context
+    child="${trimmed#-}"
+    child="${child#"${child%%[![:space:]]*}"}"
+    if [[ -n "$parent" ]]; then
+      requirements+=("${parent} ${child}")
+      parent_used=true
+    else
+      requirements+=("$child")
+    fi
+  else
+    # new parent: flush previous if it had no children
+    flush_parent
+    parent="$trimmed"
+    parent_used=false
+  fi
 done
-requirements=("${filtered[@]}")
+flush_parent
 
 if [[ ${#requirements[@]} -eq 0 ]]; then
   echo "Error: no requirements found in input."
