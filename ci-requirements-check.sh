@@ -85,13 +85,24 @@ fi
 # - Non-child, non-blank, non-comment lines are parents (context providers)
 # - A parent with no children becomes a standalone requirement
 
+# Arrays:
+#   requirements[i] = full prompt text (parent + child merged)
+#   req_parent[i]   = parent context for display ("" if standalone)
+#   req_child[i]    = child text for display (or full text if standalone)
+#   group_order[]   = ordered list of unique parent strings (for rendering)
+
 requirements=()
+req_parent=()
+req_child=()
+group_order=()
 parent=""
 parent_used=false
 
 flush_parent() {
   if [[ -n "$parent" && "$parent_used" == false ]]; then
     requirements+=("$parent")
+    req_parent+=("")
+    req_child+=("$parent")
   fi
 }
 
@@ -102,14 +113,21 @@ for line in "${raw_lines[@]}"; do
   [[ -z "$trimmed" || "$trimmed" == \#* ]] && continue
 
   if [[ "$trimmed" == -* ]]; then
-    # child: strip "- " prefix, prepend parent context
+    # child: strip "- " prefix, prepend parent context for prompt
     child="${trimmed#-}"
     child="${child#"${child%%[![:space:]]*}"}"
     if [[ -n "$parent" ]]; then
       requirements+=("${parent} ${child}")
+      req_parent+=("$parent")
+      req_child+=("$child")
+      if [[ "$parent_used" == false ]]; then
+        group_order+=("$parent")
+      fi
       parent_used=true
     else
       requirements+=("$child")
+      req_parent+=("")
+      req_child+=("$child")
     fi
   else
     # new parent: flush previous if it had no children
@@ -126,6 +144,9 @@ if [[ ${#requirements[@]} -eq 0 ]]; then
 fi
 
 total=${#requirements[@]}
+
+# Count unique parent groups (for board_lines calculation)
+num_groups=${#group_order[@]}
 
 # ── prompt template ───────────────────────────────────────────────────────────
 build_prompt() {
@@ -202,16 +223,16 @@ run_check() {
 # Renders the full status board. In TTY mode, uses ANSI escape codes to
 # overwrite previous output for a live-updating display.
 
-HEADER_LINES=5  # lines printed before the requirement list
-
 render_board() {
   local spin_frame="$1"
   local completed="$2"
   local output=""
 
   # Move cursor up to overwrite (only after first render)
-  # Each requirement = 2 lines (name + reason), plus 1 progress bar + 1 blank
-  local board_lines=$(( total * 2 + 2 ))
+  # Each requirement = 2 lines (name + reason), plus parent header lines,
+  # plus 1 progress bar + 1 blank line
+  # Standalone requirements (no parent) count as 0 extra header lines
+  local board_lines=$(( total * 2 + num_groups + 2 ))
   if [[ "$IS_TTY" == true && "$FIRST_RENDER_DONE" == true ]]; then
     output+="\033[${board_lines}A"
   fi
@@ -227,9 +248,12 @@ render_board() {
   output+="${CLEAR_LINE}  ${DIM}${bar} ${completed}/${total} completed${RESET}\n"
   output+="${CLEAR_LINE}\n"
 
-  # Requirement rows
+  # Requirement rows — grouped by parent
+  local last_parent="_NONE_"
+
   for i in "${!requirements[@]}"; do
-    local req="${requirements[$i]}"
+    local display="${req_child[$i]}"
+    local par="${req_parent[$i]}"
     local idx=$((i + 1))
     local st
     st=$(<"$WORK_DIR/$i.status")
@@ -238,9 +262,26 @@ render_board() {
     local elapsed=""
     [[ -f "$WORK_DIR/$i.elapsed" ]] && elapsed=$(<"$WORK_DIR/$i.elapsed")
 
-    # Truncate requirement text for display
-    local max_req_len=70
-    local short_req="$req"
+    # Print parent header when entering a new group
+    if [[ -n "$par" && "$par" != "$last_parent" ]]; then
+      output+="${CLEAR_LINE}  ${BOLD}${par}${RESET}\n"
+      last_parent="$par"
+    elif [[ -z "$par" ]]; then
+      last_parent="_NONE_"
+    fi
+
+    # Indentation: nested children get extra indent
+    local indent="  "
+    local reason_indent="     "
+    if [[ -n "$par" ]]; then
+      indent="    "
+      reason_indent="       "
+    fi
+
+    # Truncate display text
+    local max_req_len=66
+    [[ -n "$par" ]] && max_req_len=64
+    local short_req="$display"
     if [[ ${#short_req} -gt $max_req_len ]]; then
       short_req="${short_req:0:$max_req_len}…"
     fi
@@ -250,23 +291,23 @@ render_board() {
       OK)
         local time_str=""
         [[ -n "$elapsed" ]] && time_str=" ${DIM}(${elapsed}s)${RESET}"
-        line+="  ${GREEN}${SYM_OK}${RESET} ${BOLD}#${idx}${RESET} ${short_req}${time_str}\n"
-        line+="  ${CLEAR_LINE}     ${GREEN}${reason}${RESET}"
+        line+="${indent}${GREEN}${SYM_OK}${RESET} ${BOLD}#${idx}${RESET} ${short_req}${time_str}\n"
+        line+="${CLEAR_LINE}${reason_indent}${GREEN}${reason}${RESET}"
         ;;
       FAIL)
         local time_str=""
         [[ -n "$elapsed" ]] && time_str=" ${DIM}(${elapsed}s)${RESET}"
-        line+="  ${RED}${SYM_FAIL}${RESET} ${BOLD}#${idx}${RESET} ${short_req}${time_str}\n"
-        line+="  ${CLEAR_LINE}     ${RED}${reason}${RESET}"
+        line+="${indent}${RED}${SYM_FAIL}${RESET} ${BOLD}#${idx}${RESET} ${short_req}${time_str}\n"
+        line+="${CLEAR_LINE}${reason_indent}${RED}${reason}${RESET}"
         ;;
       RUNNING)
         local spinner="${SPINNER_FRAMES[$spin_frame]}"
-        line+="  ${YELLOW}${spinner}${RESET} ${BOLD}#${idx}${RESET} ${short_req} ${DIM}running…${RESET}\n"
-        line+="  ${CLEAR_LINE}     ${DIM}waiting for result${RESET}"
+        line+="${indent}${YELLOW}${spinner}${RESET} ${BOLD}#${idx}${RESET} ${short_req} ${DIM}running…${RESET}\n"
+        line+="${CLEAR_LINE}${reason_indent}${DIM}waiting for result${RESET}"
         ;;
       PENDING)
-        line+="  ${DIM}${SYM_WAIT}${RESET} ${BOLD}#${idx}${RESET} ${DIM}${short_req}${RESET}\n"
-        line+="  ${CLEAR_LINE}"
+        line+="${indent}${DIM}${SYM_WAIT}${RESET} ${BOLD}#${idx}${RESET} ${DIM}${short_req}${RESET}\n"
+        line+="${CLEAR_LINE}"
         ;;
     esac
     output+="${line}\n"
@@ -277,19 +318,37 @@ render_board() {
 }
 
 # ── non-TTY fallback (print as each finishes) ────────────────────────────────
+nontty_last_parent="_NONE_"
+
 print_result_line() {
   local idx="$1"
-  local req="${requirements[$idx]}"
+  local display="${req_child[$idx]}"
+  local par="${req_parent[$idx]}"
   local num=$((idx + 1))
   local st=$(<"$WORK_DIR/$idx.status")
   local reason=$(<"$WORK_DIR/$idx.reason")
 
+  # Print parent header on group change
+  if [[ -n "$par" && "$par" != "$nontty_last_parent" ]]; then
+    echo "  ${par}"
+    nontty_last_parent="$par"
+  elif [[ -z "$par" ]]; then
+    nontty_last_parent="_NONE_"
+  fi
+
+  local indent="  "
+  local reason_indent="     "
+  if [[ -n "$par" ]]; then
+    indent="    "
+    reason_indent="       "
+  fi
+
   if [[ "$st" == "OK" ]]; then
-    echo "  ${SYM_OK} #${num} ${req}"
-    echo "     ${reason}"
+    echo "${indent}${SYM_OK} #${num} ${display}"
+    echo "${reason_indent}${reason}"
   else
-    echo "  ${SYM_FAIL} #${num} ${req}"
-    echo "     ${reason}"
+    echo "${indent}${SYM_FAIL} #${num} ${display}"
+    echo "${reason_indent}${reason}"
   fi
 }
 
