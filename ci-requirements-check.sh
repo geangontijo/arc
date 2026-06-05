@@ -3,13 +3,14 @@
 # CI Requirements Checker (parallel)
 #
 # Runs each requirement through Claude CLI in parallel to verify compliance.
-# A live TUI shows real-time progress as each check completes.
+# A live TUI shows real-time progress with streaming output per requirement.
 #
 # Usage:
 #   ./scripts/ci-requirements-check.sh <requirements-file> [--project-dir <path>]
 #   echo "requirement text" | ./scripts/ci-requirements-check.sh - [--project-dir <path>]
 #
 # Requirements file format: one requirement per line (blank lines and #-comments are skipped).
+# Supports nested format — see "read requirements" section below.
 #
 # Exit code: 0 if all requirements pass, 1 if any fails, 2 on usage error.
 
@@ -18,16 +19,17 @@ set -euo pipefail
 # ── defaults ──────────────────────────────────────────────────────────────────
 PROJECT_DIR="${PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 CLAUDE_CMD="${CLAUDE_CMD:-claude}"
+OUTPUT_WINDOW=${OUTPUT_WINDOW:-10}
 
 # ── colors & symbols ─────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
   GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[0;33m'; DIM='\033[2m'
-  BOLD='\033[1m'; RESET='\033[0m'; CLEAR_LINE='\033[2K'
+  BOLD='\033[1m'; RESET='\033[0m'; CLEAR_LINE='\033[2K'; CLEAR_BELOW='\033[J'
   SPINNER_FRAMES=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
   SYM_OK='✓'; SYM_FAIL='✗'; SYM_WAIT='○'
   IS_TTY=true
 else
-  GREEN=''; RED=''; YELLOW=''; DIM=''; BOLD=''; RESET=''; CLEAR_LINE=''
+  GREEN=''; RED=''; YELLOW=''; DIM=''; BOLD=''; RESET=''; CLEAR_LINE=''; CLEAR_BELOW=''
   SPINNER_FRAMES=('-')
   SYM_OK='OK'; SYM_FAIL='FAIL'; SYM_WAIT='-'
   IS_TTY=false
@@ -80,11 +82,6 @@ else
   done < "$INPUT_FILE"
 fi
 
-# Pass 1: classify lines into (parent, child[]) groups
-# - Lines starting with "- " are children of the preceding non-child line
-# - Non-child, non-blank, non-comment lines are parents (context providers)
-# - A parent with no children becomes a standalone requirement
-
 # Arrays:
 #   requirements[i] = full prompt text (parent + child merged)
 #   req_parent[i]   = parent context for display ("" if standalone)
@@ -113,7 +110,6 @@ for line in "${raw_lines[@]}"; do
   [[ -z "$trimmed" || "$trimmed" == \#* ]] && continue
 
   if [[ "$trimmed" == -* ]]; then
-    # child: strip "- " prefix, prepend parent context for prompt
     child="${trimmed#-}"
     child="${child#"${child%%[![:space:]]*}"}"
     if [[ -n "$parent" ]]; then
@@ -130,7 +126,6 @@ for line in "${raw_lines[@]}"; do
       req_child+=("$child")
     fi
   else
-    # new parent: flush previous if it had no children
     flush_parent
     parent="$trimmed"
     parent_used=false
@@ -144,8 +139,6 @@ if [[ ${#requirements[@]} -eq 0 ]]; then
 fi
 
 total=${#requirements[@]}
-
-# Count unique parent groups (for board_lines calculation)
 num_groups=${#group_order[@]}
 
 # ── prompt template ───────────────────────────────────────────────────────────
@@ -172,14 +165,83 @@ PROMPT
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-# status files: $WORK_DIR/<idx>.status  = PENDING | RUNNING | OK | FAIL
-#               $WORK_DIR/<idx>.reason  = reason text
-#               $WORK_DIR/<idx>.elapsed = seconds taken
+# Files per requirement:
+#   $WORK_DIR/<idx>.status  = PENDING | RUNNING | OK | FAIL
+#   $WORK_DIR/<idx>.reason  = reason text
+#   $WORK_DIR/<idx>.elapsed = seconds taken
+#   $WORK_DIR/<idx>.output  = streaming claude CLI output
 
 for i in "${!requirements[@]}"; do
   echo "PENDING" > "$WORK_DIR/$i.status"
   echo ""        > "$WORK_DIR/$i.reason"
+  touch "$WORK_DIR/$i.output"
 done
+
+# ── stream event processor ────────────────────────────────────────────────────
+# Converts stream-json events into human-readable lines for the output window.
+# Reads JSON lines from stdin, writes readable lines to stdout.
+process_stream() {
+  while IFS= read -r json_line; do
+    # Skip empty lines
+    [[ -z "$json_line" ]] && continue
+
+    local event_type
+    event_type=$(echo "$json_line" | jq -r '.type // empty' 2>/dev/null) || continue
+
+    case "$event_type" in
+      assistant)
+        # Extract content blocks from the message
+        local content_types
+        content_types=$(echo "$json_line" | jq -r '.message.content[]?.type // empty' 2>/dev/null) || continue
+
+        for ctype in $content_types; do
+          case "$ctype" in
+            thinking)
+              local thinking
+              thinking=$(echo "$json_line" | jq -r '.message.content[] | select(.type=="thinking") | .thinking // empty' 2>/dev/null)
+              [[ -n "$thinking" ]] && echo "[thinking] $thinking"
+              ;;
+            tool_use)
+              local tool_name tool_input
+              tool_name=$(echo "$json_line" | jq -r '.message.content[] | select(.type=="tool_use") | .name // empty' 2>/dev/null)
+              tool_input=$(echo "$json_line" | jq -r '.message.content[] | select(.type=="tool_use") | .input | to_entries | map(.key + "=" + (.value | tostring | .[0:60])) | join(", ")' 2>/dev/null)
+              [[ -n "$tool_name" ]] && echo "[tool] ${tool_name}(${tool_input})"
+              ;;
+            text)
+              local text
+              text=$(echo "$json_line" | jq -r '.message.content[] | select(.type=="text") | .text // empty' 2>/dev/null)
+              [[ -n "$text" ]] && echo "[output] $text"
+              ;;
+          esac
+        done
+        ;;
+      user)
+        # Tool results
+        local has_tool_result
+        has_tool_result=$(echo "$json_line" | jq -r '.message.content[]?.type // empty' 2>/dev/null | grep -c tool_result || true)
+        if [[ "$has_tool_result" -gt 0 ]]; then
+          local tool_id duration
+          tool_id=$(echo "$json_line" | jq -r '.message.content[0].tool_use_id // empty' 2>/dev/null)
+          duration=$(echo "$json_line" | jq -r '.tool_use_result.durationMs // empty' 2>/dev/null)
+          local result_summary
+          result_summary=$(echo "$json_line" | jq -r '
+            .tool_use_result |
+            if .filenames then
+              (.filenames | length | tostring) + " file(s) found"
+            elif .numFiles then
+              (.numFiles | tostring) + " file(s)"
+            else
+              "done"
+            end
+          ' 2>/dev/null)
+          local time_info=""
+          [[ -n "$duration" && "$duration" != "null" ]] && time_info=" (${duration}ms)"
+          echo "[result] ${result_summary}${time_info}"
+        fi
+        ;;
+    esac
+  done
+}
 
 # ── worker function (runs in background) ─────────────────────────────────────
 run_check() {
@@ -192,10 +254,22 @@ run_check() {
   local prompt
   prompt="$(build_prompt "$req")"
 
-  local raw_output=""
-  if raw_output=$("$CLAUDE_CMD" -p "$prompt" -d "$PROJECT_DIR" --output-format text 2>&1); then
+  # Stream JSON events, process into readable lines for the TUI,
+  # and also capture raw JSON for status parsing at the end.
+  local exit_code=0
+  "$CLAUDE_CMD" -p "$prompt" -d "$PROJECT_DIR" \
+    --output-format stream-json --verbose 2>&1 \
+    | tee "$WORK_DIR/$idx.raw" \
+    | process_stream \
+    > "$WORK_DIR/$idx.output" || exit_code=$?
+
+  # Parse the result event from raw JSON for the STATUS line
+  local result_text
+  result_text=$(jq -r 'select(.type=="result") | .result // empty' "$WORK_DIR/$idx.raw" 2>/dev/null || true)
+
+  if [[ $exit_code -eq 0 && -n "$result_text" ]]; then
     local status_line
-    status_line=$(echo "$raw_output" | grep -E '^STATUS:\s*(OK|FAIL)\s*\|' | tail -1 || true)
+    status_line=$(echo "$result_text" | grep -E '^STATUS:\s*(OK|FAIL)\s*\|' | tail -1 || true)
 
     if [[ -n "$status_line" ]]; then
       local status reason
@@ -206,13 +280,15 @@ run_check() {
       echo "$reason"  > "$WORK_DIR/$idx.reason"
     else
       local short_output
-      short_output=$(echo "$raw_output" | head -3 | tr '\n' ' ' | cut -c1-200)
+      short_output=$(echo "$result_text" | head -3 | tr '\n' ' ' | cut -c1-200)
       echo "FAIL" > "$WORK_DIR/$idx.status"
       echo "(unparseable response) $short_output" > "$WORK_DIR/$idx.reason"
     fi
   else
+    local error_text
+    error_text=$(jq -r 'select(.type=="result") | .result // empty' "$WORK_DIR/$idx.raw" 2>/dev/null || true)
     echo "FAIL" > "$WORK_DIR/$idx.status"
-    echo "(claude cli error) $(echo "$raw_output" | head -1 | cut -c1-200)" > "$WORK_DIR/$idx.reason"
+    echo "(claude cli error) $(echo "${error_text:-unknown error}" | head -1 | cut -c1-200)" > "$WORK_DIR/$idx.reason"
   fi
 
   echo "$(( SECONDS - start_time ))" > "$WORK_DIR/$idx.elapsed"
@@ -220,21 +296,21 @@ run_check() {
 
 # ── TUI rendering ────────────────────────────────────────────────────────────
 #
-# Renders the full status board. In TTY mode, uses ANSI escape codes to
-# overwrite previous output for a live-updating display.
+# Dynamic-height board: RUNNING items show a live output window, completed
+# items collapse to 2 lines. We track the previous render's line count and
+# use \033[J (clear below) to handle shrinking output.
+
+LAST_RENDER_LINES=0
 
 render_board() {
   local spin_frame="$1"
   local completed="$2"
   local output=""
+  local line_count=0
 
-  # Move cursor up to overwrite (only after first render)
-  # Each requirement = 2 lines (name + reason), plus parent header lines,
-  # plus 1 progress bar + 1 blank line
-  # Standalone requirements (no parent) count as 0 extra header lines
-  local board_lines=$(( total * 2 + num_groups + 2 ))
-  if [[ "$IS_TTY" == true && "$FIRST_RENDER_DONE" == true ]]; then
-    output+="\033[${board_lines}A"
+  # Move cursor up to overwrite previous render
+  if [[ "$IS_TTY" == true && $LAST_RENDER_LINES -gt 0 ]]; then
+    output+="\033[${LAST_RENDER_LINES}A"
   fi
 
   # Progress bar
@@ -247,6 +323,7 @@ render_board() {
 
   output+="${CLEAR_LINE}  ${DIM}${bar} ${completed}/${total} completed${RESET}\n"
   output+="${CLEAR_LINE}\n"
+  line_count=$((line_count + 2))
 
   # Requirement rows — grouped by parent
   local last_parent="_NONE_"
@@ -266,16 +343,17 @@ render_board() {
     if [[ -n "$par" && "$par" != "$last_parent" ]]; then
       output+="${CLEAR_LINE}  ${BOLD}${par}${RESET}\n"
       last_parent="$par"
+      line_count=$((line_count + 1))
     elif [[ -z "$par" ]]; then
       last_parent="_NONE_"
     fi
 
-    # Indentation: nested children get extra indent
+    # Indentation
     local indent="  "
-    local reason_indent="     "
+    local out_indent="     "
     if [[ -n "$par" ]]; then
       indent="    "
-      reason_indent="       "
+      out_indent="       "
     fi
 
     # Truncate display text
@@ -286,35 +364,70 @@ render_board() {
       short_req="${short_req:0:$max_req_len}…"
     fi
 
-    local line="${CLEAR_LINE}"
+    # Max width for output window lines
+    local term_width
+    term_width=$(tput cols 2>/dev/null || echo 120)
+    local out_prefix_len=${#out_indent}
+    # +4 for "╎ " prefix
+    local max_out_width=$(( term_width - out_prefix_len - 4 ))
+    [[ $max_out_width -lt 20 ]] && max_out_width=20
+
     case "$st" in
       OK)
         local time_str=""
         [[ -n "$elapsed" ]] && time_str=" ${DIM}(${elapsed}s)${RESET}"
-        line+="${indent}${GREEN}${SYM_OK}${RESET} ${BOLD}#${idx}${RESET} ${short_req}${time_str}\n"
-        line+="${CLEAR_LINE}${reason_indent}${GREEN}${reason}${RESET}"
+        output+="${CLEAR_LINE}${indent}${GREEN}${SYM_OK}${RESET} ${BOLD}#${idx}${RESET} ${short_req}${time_str}\n"
+        output+="${CLEAR_LINE}${out_indent}${GREEN}${reason}${RESET}\n"
+        line_count=$((line_count + 2))
         ;;
       FAIL)
         local time_str=""
         [[ -n "$elapsed" ]] && time_str=" ${DIM}(${elapsed}s)${RESET}"
-        line+="${indent}${RED}${SYM_FAIL}${RESET} ${BOLD}#${idx}${RESET} ${short_req}${time_str}\n"
-        line+="${CLEAR_LINE}${reason_indent}${RED}${reason}${RESET}"
+        output+="${CLEAR_LINE}${indent}${RED}${SYM_FAIL}${RESET} ${BOLD}#${idx}${RESET} ${short_req}${time_str}\n"
+        output+="${CLEAR_LINE}${out_indent}${RED}${reason}${RESET}\n"
+        line_count=$((line_count + 2))
         ;;
       RUNNING)
         local spinner="${SPINNER_FRAMES[$spin_frame]}"
-        line+="${indent}${YELLOW}${spinner}${RESET} ${BOLD}#${idx}${RESET} ${short_req} ${DIM}running…${RESET}\n"
-        line+="${CLEAR_LINE}${reason_indent}${DIM}waiting for result${RESET}"
+        output+="${CLEAR_LINE}${indent}${YELLOW}${spinner}${RESET} ${BOLD}#${idx}${RESET} ${short_req} ${DIM}running…${RESET}\n"
+        line_count=$((line_count + 1))
+
+        # Live output window: last N lines from the streaming output file
+        local out_lines=()
+        if [[ -s "$WORK_DIR/$i.output" ]]; then
+          while IFS= read -r oline; do
+            out_lines+=("$oline")
+          done < <(tail -n "$OUTPUT_WINDOW" "$WORK_DIR/$i.output" 2>/dev/null || true)
+        fi
+
+        local out_count=${#out_lines[@]}
+        if [[ $out_count -gt 0 ]]; then
+          for oline in "${out_lines[@]}"; do
+            # Truncate long lines
+            local truncated="$oline"
+            if [[ ${#truncated} -gt $max_out_width ]]; then
+              truncated="${truncated:0:$max_out_width}…"
+            fi
+            output+="${CLEAR_LINE}${out_indent}${DIM}╎ ${truncated}${RESET}\n"
+            line_count=$((line_count + 1))
+          done
+        else
+          output+="${CLEAR_LINE}${out_indent}${DIM}╎ waiting for output…${RESET}\n"
+          line_count=$((line_count + 1))
+        fi
         ;;
       PENDING)
-        line+="${indent}${DIM}${SYM_WAIT}${RESET} ${BOLD}#${idx}${RESET} ${DIM}${short_req}${RESET}\n"
-        line+="${CLEAR_LINE}"
+        output+="${CLEAR_LINE}${indent}${DIM}${SYM_WAIT}${RESET} ${BOLD}#${idx}${RESET} ${DIM}${short_req}${RESET}\n"
+        line_count=$((line_count + 1))
         ;;
     esac
-    output+="${line}\n"
   done
 
+  # Clear any leftover lines from a previous taller render
+  output+="${CLEAR_BELOW}"
+
   echo -ne "$output"
-  FIRST_RENDER_DONE=true
+  LAST_RENDER_LINES=$line_count
 }
 
 # ── non-TTY fallback (print as each finishes) ────────────────────────────────
@@ -328,7 +441,6 @@ print_result_line() {
   local st=$(<"$WORK_DIR/$idx.status")
   local reason=$(<"$WORK_DIR/$idx.reason")
 
-  # Print parent header on group change
   if [[ -n "$par" && "$par" != "$nontty_last_parent" ]]; then
     echo "  ${par}"
     nontty_last_parent="$par"
@@ -376,11 +488,9 @@ for i in "${!requirements[@]}"; do
 done
 
 # ── event loop: refresh TUI until all done ────────────────────────────────────
-FIRST_RENDER_DONE=false
 spin=0
 
 if [[ "$IS_TTY" == true ]]; then
-  # Initial render
   render_board $spin 0
 
   while true; do
@@ -397,7 +507,6 @@ if [[ "$IS_TTY" == true ]]; then
     sleep 0.15
   done
 else
-  # Non-TTY: wait for each, print as done
   echo ""
   for i in "${!requirements[@]}"; do
     wait "${pids[$i]}" 2>/dev/null || true
