@@ -1,0 +1,5 @@
+- Has a script file that receives an requirements input and output the status of each requirement?
+Repository level
+- The cli tool has an very easy method to install, that works independently of OS of the user?
+- The tool has a atractive README developer-freindly and able to be at top of github trendings?
+

@@ -18,8 +18,40 @@ set -euo pipefail
 
 # ── defaults ──────────────────────────────────────────────────────────────────
 PROJECT_DIR="${PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
-CLAUDE_CMD="${CLAUDE_CMD:-claude}"
+
+# Auto-detect defaults: agy (preferred) -> claude
+DEFAULT_CMD="claude"
+if command -v agy >/dev/null 2>&1; then
+  DEFAULT_CMD="agy"
+elif command -v antigravity >/dev/null 2>&1; then
+  DEFAULT_CMD="antigravity"
+fi
+
+CLAUDE_CMD="${CLAUDE_CMD:-$DEFAULT_CMD}"
 OUTPUT_WINDOW=${OUTPUT_WINDOW:-10}
+
+# Determine the type of the CLI (claude or agy)
+detect_cli_type() {
+  local cmd="$1"
+  local exe
+  exe=$(echo "$cmd" | awk '{print $1}')
+  local cmd_name
+  cmd_name=$(basename "$exe")
+  if [[ "$cmd_name" == "agy" || "$cmd_name" == "antigravity" ]]; then
+    echo "agy"
+  elif [[ "$cmd_name" == "claude" ]]; then
+    echo "claude"
+  else
+    # Fallback to inspecting help output or checking names
+    if "$exe" --help 2>&1 | grep -q "Usage of agy:"; then
+      echo "agy"
+    else
+      echo "claude"
+    fi
+  fi
+}
+
+CLI_TYPE=$(detect_cli_type "$CLAUDE_CMD")
 
 # ── colors & symbols ─────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -254,41 +286,71 @@ run_check() {
   local prompt
   prompt="$(build_prompt "$req")"
 
-  # Stream JSON events, process into readable lines for the TUI,
-  # and also capture raw JSON for status parsing at the end.
   local exit_code=0
-  "$CLAUDE_CMD" -p "$prompt" -d "$PROJECT_DIR" \
-    --output-format stream-json --verbose 2>&1 \
-    | tee "$WORK_DIR/$idx.raw" \
-    | process_stream \
-    > "$WORK_DIR/$idx.output" || exit_code=$?
 
-  # Parse the result event from raw JSON for the STATUS line
-  local result_text
-  result_text=$(jq -r 'select(.type=="result") | .result // empty' "$WORK_DIR/$idx.raw" 2>/dev/null || true)
+  if [[ "$CLI_TYPE" == "agy" ]]; then
+    # agy runs in print mode with --dangerously-skip-permissions, directing output/thoughts to stdout/stderr.
+    # We pipe both stdout and stderr to the output file so the TUI can show real-time stream.
+    $CLAUDE_CMD -p "$prompt" --add-dir "$PROJECT_DIR" --dangerously-skip-permissions > "$WORK_DIR/$idx.output" 2>&1 || exit_code=$?
 
-  if [[ $exit_code -eq 0 && -n "$result_text" ]]; then
+    # For agy, the raw output is the final output file.
     local status_line
-    status_line=$(echo "$result_text" | grep -E '^STATUS:\s*(OK|FAIL)\s*\|' | tail -1 || true)
+    status_line=$(grep -E 'STATUS:\s*(OK|FAIL)\s*\|' "$WORK_DIR/$idx.output" | tail -1 || true)
 
-    if [[ -n "$status_line" ]]; then
+    if [[ $exit_code -eq 0 && -n "$status_line" ]]; then
       local status reason
-      status=$(echo "$status_line" | sed -E 's/^STATUS:\s*(OK|FAIL)\s*\|.*/\1/')
-      reason=$(echo "$status_line" | sed -E 's/^STATUS:\s*(OK|FAIL)\s*\|\s*REASON:\s*//')
+      status=$(echo "$status_line" | sed -E 's/.*STATUS:\s*(OK|FAIL)\s*\|.*/\1/')
+      reason=$(echo "$status_line" | sed -E 's/.*STATUS:\s*(OK|FAIL)\s*\|\s*REASON:\s*//')
 
       echo "$status" > "$WORK_DIR/$idx.status"
       echo "$reason"  > "$WORK_DIR/$idx.reason"
+    elif [[ $exit_code -ne 0 ]]; then
+      local error_text
+      error_text=$(tail -n 5 "$WORK_DIR/$idx.output" | tr '\n' ' ' | cut -c1-200)
+      echo "FAIL" > "$WORK_DIR/$idx.status"
+      echo "(agy cli error) ${error_text:-unknown error}" > "$WORK_DIR/$idx.reason"
     else
       local short_output
-      short_output=$(echo "$result_text" | head -3 | tr '\n' ' ' | cut -c1-200)
+      short_output=$(tail -n 3 "$WORK_DIR/$idx.output" | tr '\n' ' ' | cut -c1-200)
       echo "FAIL" > "$WORK_DIR/$idx.status"
       echo "(unparseable response) $short_output" > "$WORK_DIR/$idx.reason"
     fi
   else
-    local error_text
-    error_text=$(jq -r 'select(.type=="result") | .result // empty' "$WORK_DIR/$idx.raw" 2>/dev/null || true)
-    echo "FAIL" > "$WORK_DIR/$idx.status"
-    echo "(claude cli error) $(echo "${error_text:-unknown error}" | head -1 | cut -c1-200)" > "$WORK_DIR/$idx.reason"
+    # Stream JSON events, process into readable lines for the TUI,
+    # and also capture raw JSON for status parsing at the end.
+    "$CLAUDE_CMD" -p "$prompt" -d "$PROJECT_DIR" \
+      --output-format stream-json --verbose 2>&1 \
+      | tee "$WORK_DIR/$idx.raw" \
+      | process_stream \
+      > "$WORK_DIR/$idx.output" || exit_code=$?
+
+    # Parse the result event from raw JSON for the STATUS line
+    local result_text
+    result_text=$(jq -r 'select(.type=="result") | .result // empty' "$WORK_DIR/$idx.raw" 2>/dev/null || true)
+
+    if [[ $exit_code -eq 0 && -n "$result_text" ]]; then
+      local status_line
+      status_line=$(echo "$result_text" | grep -E '^STATUS:\s*(OK|FAIL)\s*\|' | tail -1 || true)
+
+      if [[ -n "$status_line" ]]; then
+        local status reason
+        status=$(echo "$status_line" | sed -E 's/^STATUS:\s*(OK|FAIL)\s*\|.*/\1/')
+        reason=$(echo "$status_line" | sed -E 's/^STATUS:\s*(OK|FAIL)\s*\|\s*REASON:\s*//')
+
+        echo "$status" > "$WORK_DIR/$idx.status"
+        echo "$reason"  > "$WORK_DIR/$idx.reason"
+      else
+        local short_output
+        short_output=$(echo "$result_text" | head -3 | tr '\n' ' ' | cut -c1-200)
+        echo "FAIL" > "$WORK_DIR/$idx.status"
+        echo "(unparseable response) $short_output" > "$WORK_DIR/$idx.reason"
+      fi
+    else
+      local error_text
+      error_text=$(jq -r 'select(.type=="result") | .result // empty' "$WORK_DIR/$idx.raw" 2>/dev/null || true)
+      echo "FAIL" > "$WORK_DIR/$idx.status"
+      echo "(claude cli error) $(echo "${error_text:-unknown error}" | head -1 | cut -c1-200)" > "$WORK_DIR/$idx.reason"
+    fi
   fi
 
   echo "$(( SECONDS - start_time ))" > "$WORK_DIR/$idx.elapsed"
@@ -307,6 +369,8 @@ render_board() {
   local completed="$2"
   local output=""
   local line_count=0
+  local term_width
+  term_width=$(tput cols 2>/dev/null || echo 120)
 
   # Move cursor up to overwrite previous render
   if [[ "$IS_TTY" == true && $LAST_RENDER_LINES -gt 0 ]]; then
@@ -339,9 +403,15 @@ render_board() {
     local elapsed=""
     [[ -f "$WORK_DIR/$i.elapsed" ]] && elapsed=$(<"$WORK_DIR/$i.elapsed")
 
-    # Print parent header when entering a new group
+    # Print parent header when entering a new group (truncated to term width to prevent wrapping)
     if [[ -n "$par" && "$par" != "$last_parent" ]]; then
-      output+="${CLEAR_LINE}  ${BOLD}${par}${RESET}\n"
+      local max_par_width=$(( term_width - 4 ))
+      [[ $max_par_width -lt 20 ]] && max_par_width=20
+      local short_par="$par"
+      if [[ ${#short_par} -gt $max_par_width ]]; then
+        short_par="${short_par:0:$max_par_width}…"
+      fi
+      output+="${CLEAR_LINE}  ${BOLD}${short_par}${RESET}\n"
       last_parent="$par"
       line_count=$((line_count + 1))
     elif [[ -z "$par" ]]; then
@@ -356,35 +426,46 @@ render_board() {
       out_indent="       "
     fi
 
-    # Truncate display text
-    local max_req_len=66
-    [[ -n "$par" ]] && max_req_len=64
+    # Truncate display text dynamically based on terminal width.
+    # The widest line format is RUNNING: indent + spinner + " #NN " + req + " running…"
+    # indent_len + 1(spinner) + 1(space) + 1(#) + ${#idx} + 1(space) + req + 1(space) + 10("running…")
+    local indent_len=${#indent}
+    local idx_len=${#idx}
+    local fixed_overhead=$(( indent_len + 1 + 1 + 1 + idx_len + 1 + 1 + 10 ))
+    local max_req_len=$(( term_width - fixed_overhead ))
+    [[ $max_req_len -lt 20 ]] && max_req_len=20
     local short_req="$display"
     if [[ ${#short_req} -gt $max_req_len ]]; then
       short_req="${short_req:0:$max_req_len}…"
     fi
 
     # Max width for output window lines
-    local term_width
-    term_width=$(tput cols 2>/dev/null || echo 120)
     local out_prefix_len=${#out_indent}
     # +4 for "╎ " prefix
     local max_out_width=$(( term_width - out_prefix_len - 4 ))
     [[ $max_out_width -lt 20 ]] && max_out_width=20
+
+    # Max width for reason line to prevent wrapping and progress bar duplication
+    local max_reason_width=$(( term_width - out_prefix_len - 2 ))
+    [[ $max_reason_width -lt 20 ]] && max_reason_width=20
+    local short_reason="$reason"
+    if [[ ${#short_reason} -gt $max_reason_width ]]; then
+      short_reason="${short_reason:0:$max_reason_width}…"
+    fi
 
     case "$st" in
       OK)
         local time_str=""
         [[ -n "$elapsed" ]] && time_str=" ${DIM}(${elapsed}s)${RESET}"
         output+="${CLEAR_LINE}${indent}${GREEN}${SYM_OK}${RESET} ${BOLD}#${idx}${RESET} ${short_req}${time_str}\n"
-        output+="${CLEAR_LINE}${out_indent}${GREEN}${reason}${RESET}\n"
+        output+="${CLEAR_LINE}${out_indent}${GREEN}${short_reason}${RESET}\n"
         line_count=$((line_count + 2))
         ;;
       FAIL)
         local time_str=""
         [[ -n "$elapsed" ]] && time_str=" ${DIM}(${elapsed}s)${RESET}"
         output+="${CLEAR_LINE}${indent}${RED}${SYM_FAIL}${RESET} ${BOLD}#${idx}${RESET} ${short_req}${time_str}\n"
-        output+="${CLEAR_LINE}${out_indent}${RED}${reason}${RESET}\n"
+        output+="${CLEAR_LINE}${out_indent}${RED}${short_reason}${RESET}\n"
         line_count=$((line_count + 2))
         ;;
       RUNNING)
