@@ -19,9 +19,11 @@ set -euo pipefail
 # ── defaults ──────────────────────────────────────────────────────────────────
 PROJECT_DIR="${PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 
-# Auto-detect defaults: agy (preferred) -> claude
+# Auto-detect defaults: opencode (preferred) -> agy -> claude
 DEFAULT_CMD="claude"
-if command -v agy >/dev/null 2>&1; then
+if command -v opencode >/dev/null 2>&1; then
+  DEFAULT_CMD="opencode"
+elif command -v agy >/dev/null 2>&1; then
   DEFAULT_CMD="agy"
 elif command -v antigravity >/dev/null 2>&1; then
   DEFAULT_CMD="antigravity"
@@ -30,14 +32,16 @@ fi
 CLAUDE_CMD="${CLAUDE_CMD:-$DEFAULT_CMD}"
 OUTPUT_WINDOW=${OUTPUT_WINDOW:-10}
 
-# Determine the type of the CLI (claude or agy)
+# Determine the type of the CLI (opencode, agy, or claude)
 detect_cli_type() {
   local cmd="$1"
   local exe
   exe=$(echo "$cmd" | awk '{print $1}')
   local cmd_name
   cmd_name=$(basename "$exe")
-  if [[ "$cmd_name" == "agy" || "$cmd_name" == "antigravity" ]]; then
+  if [[ "$cmd_name" == "opencode" ]]; then
+    echo "opencode"
+  elif [[ "$cmd_name" == "agy" || "$cmd_name" == "antigravity" ]]; then
     echo "agy"
   elif [[ "$cmd_name" == "claude" ]]; then
     echo "claude"
@@ -45,6 +49,8 @@ detect_cli_type() {
     # Fallback to inspecting help output or checking names
     if "$exe" --help 2>&1 | grep -q "Usage of agy:"; then
       echo "agy"
+    elif "$exe" --help 2>&1 | grep -q "opencode"; then
+      echo "opencode"
     else
       echo "claude"
     fi
@@ -288,7 +294,37 @@ run_check() {
 
   local exit_code=0
 
-  if [[ "$CLI_TYPE" == "agy" ]]; then
+  if [[ "$CLI_TYPE" == "opencode" ]]; then
+    # opencode uses subcommand `run` and passes the message positionally.
+    # `--dir` sets the working directory; `--dangerously-skip-permissions`
+    # auto-approves tool calls so the run is non-interactive.
+    # Both stdout and stderr are captured for the live output window.
+    $CLAUDE_CMD run "$prompt" --dir "$PROJECT_DIR" --dangerously-skip-permissions > "$WORK_DIR/$idx.output" 2>&1 || exit_code=$?
+
+    # Strip ANSI escape sequences so the STATUS line parses reliably.
+    local status_line
+    status_line=$(sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$WORK_DIR/$idx.output" \
+      | grep -E 'STATUS:[[:space:]]*(OK|FAIL)[[:space:]]*\|' | tail -1 || true)
+
+    if [[ $exit_code -eq 0 && -n "$status_line" ]]; then
+      local status reason
+      status=$(echo "$status_line" | sed -E 's/.*STATUS:[[:space:]]*(OK|FAIL)[[:space:]]*\|.*/\1/')
+      reason=$(echo "$status_line" | sed -E 's/.*STATUS:[[:space:]]*(OK|FAIL)[[:space:]]*\|[[:space:]]*REASON:[[:space:]]*//')
+
+      echo "$status" > "$WORK_DIR/$idx.status"
+      echo "$reason"  > "$WORK_DIR/$idx.reason"
+    elif [[ $exit_code -ne 0 ]]; then
+      local error_text
+      error_text=$(tail -n 5 "$WORK_DIR/$idx.output" | tr '\n' ' ' | cut -c1-200)
+      echo "FAIL" > "$WORK_DIR/$idx.status"
+      echo "(opencode cli error) ${error_text:-unknown error}" > "$WORK_DIR/$idx.reason"
+    else
+      local short_output
+      short_output=$(tail -n 3 "$WORK_DIR/$idx.output" | tr '\n' ' ' | cut -c1-200)
+      echo "FAIL" > "$WORK_DIR/$idx.status"
+      echo "(unparseable response) $short_output" > "$WORK_DIR/$idx.reason"
+    fi
+  elif [[ "$CLI_TYPE" == "agy" ]]; then
     # agy runs in print mode with --dangerously-skip-permissions, directing output/thoughts to stdout/stderr.
     # We pipe both stdout and stderr to the output file so the TUI can show real-time stream.
     $CLAUDE_CMD -p "$prompt" --add-dir "$PROJECT_DIR" --dangerously-skip-permissions > "$WORK_DIR/$idx.output" 2>&1 || exit_code=$?
