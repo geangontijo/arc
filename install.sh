@@ -16,7 +16,7 @@
 set -euo pipefail
 
 readonly APP_NAME="arc"
-readonly SOURCE_SCRIPT="ci-requirements-check.sh"
+readonly SOURCE_SCRIPT="arc.sh"
 readonly VERSION="0.1.0"
 readonly MANIFEST_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/arc"
 readonly MANIFEST_FILE="$MANIFEST_DIR/install.path"

@@ -6,8 +6,8 @@
 # A live TUI shows real-time progress with streaming output per requirement.
 #
 # Usage:
-#   ./scripts/ci-requirements-check.sh <requirements-file> [--project-dir <path>] [--agent <name>]
-#   echo "requirement text" | ./scripts/ci-requirements-check.sh - [--project-dir <path>] [--agent <name>]
+#   arc <requirements-file> [--project-dir <path>] [--agent <name>]
+#   echo "requirement text" | arc - [--project-dir <path>] [--agent <name>]
 #
 # --agent <name>     Force a specific code agent. One of: claude, opencode, agy, antigravity.
 #                    Overrides the CLAUDE_CMD env var and the auto-detected default.
