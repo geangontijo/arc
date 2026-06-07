@@ -6,8 +6,11 @@
 # A live TUI shows real-time progress with streaming output per requirement.
 #
 # Usage:
-#   ./scripts/ci-requirements-check.sh <requirements-file> [--project-dir <path>]
-#   echo "requirement text" | ./scripts/ci-requirements-check.sh - [--project-dir <path>]
+#   ./scripts/ci-requirements-check.sh <requirements-file> [--project-dir <path>] [--agent <name>]
+#   echo "requirement text" | ./scripts/ci-requirements-check.sh - [--project-dir <path>] [--agent <name>]
+#
+# --agent <name>     Force a specific code agent. One of: claude, opencode, agy, antigravity.
+#                    Overrides the CLAUDE_CMD env var and the auto-detected default.
 #
 # Requirements file format: one requirement per line (blank lines and #-comments are skipped).
 # Supports nested format — see "read requirements" section below.
@@ -75,11 +78,13 @@ fi
 
 # ── usage ─────────────────────────────────────────────────────────────────────
 usage() {
-  echo "Usage: $0 <requirements-file | -> [--project-dir <path>]"
+  echo "Usage: $0 <requirements-file | -> [--project-dir <path>] [--agent <name>]"
   echo ""
   echo "  <requirements-file>  Path to a file with one requirement per line."
   echo "  -                    Read requirements from stdin."
-  echo "  --project-dir        Project directory for Claude context (default: git root)."
+  echo "  --project-dir        Project directory for the agent context (default: git root)."
+  echo "  --agent <name>       Force a specific code agent: claude, opencode, agy, antigravity."
+  echo "                       Overrides CLAUDE_CMD and the auto-detected default."
   exit 2
 }
 
@@ -91,6 +96,14 @@ INPUT_FILE="$1"; shift
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --project-dir) PROJECT_DIR="$2"; shift 2 ;;
+    --agent)
+      AGENT_NAME="${2,,}"
+      case "$AGENT_NAME" in
+        claude|opencode|agy|antigravity) CLAUDE_CMD="$AGENT_NAME" ;;
+        *) echo "Error: unknown agent '$2'. Valid agents: claude, opencode, agy, antigravity."; exit 2 ;;
+      esac
+      shift 2
+      ;;
     *) echo "Unknown option: $1"; usage ;;
   esac
 done
@@ -588,6 +601,7 @@ pids=()
 echo -e "${BOLD}Requirements Check${RESET}"
 echo -e "${BOLD}$(printf '=%.0s' {1..60})${RESET}"
 echo -e "Project: ${PROJECT_DIR}"
+echo -e "Agent: ${CLAUDE_CMD} ${DIM}(${CLI_TYPE})${RESET}"
 echo -e "Requirements: ${total} ${DIM}(parallel)${RESET}"
 echo -e "${BOLD}$(printf '=%.0s' {1..60})${RESET}"
 
