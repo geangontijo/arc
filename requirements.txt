@@ -1,4 +1,10 @@
 - Has a script file that receives an requirements input and output the status of each requirement?
+Cli tool high level
+- The Cli tool has a flag --agent that allow the user select which agent will process each requirement?
+Cli tool are supporting
+- Claude?
+- OpenCode?
+- Antigravity?
 Repository level
 - The cli tool has an very easy method to install, that works independently of OS of the user?
 - The tool has a atractive README developer-freindly and able to be at top of github trendings?
